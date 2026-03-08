@@ -1,0 +1,13 @@
+# Copy to application.properties or set as environment variables.
+# Never commit real values to version control.
+#
+# If Telegram/OpenAI are not set, the app still starts: the bot and
+# Telegram REST endpoints are disabled until you set these.
+
+# Telegram Bot (from @BotFather) - when set, the bot and /telegram APIs are enabled
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_BOT_USERNAME=your_bot_username
+TELEGRAM_BOT_CHAT_ID=your_chat_or_group_id
+
+# OpenAI API
+OPENAI_API_KEY=your_openai_api_key

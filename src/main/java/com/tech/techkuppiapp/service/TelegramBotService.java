@@ -1,132 +1,503 @@
 package com.tech.techkuppiapp.service;
 
+import com.tech.techkuppiapp.dto.GeneratedQuestion;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Service;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
-import org.telegram.telegrambots.meta.api.methods.polls.SendPoll;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
-import java.util.Arrays;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
+@ConditionalOnExpression("!'${telegram.bot.token:}'.isBlank()")
 public class TelegramBotService extends TelegramLongPollingBot {
 
-    @Value("${telegram.bot.token}")
-    private String botToken;
+    private static final Logger log = LoggerFactory.getLogger(TelegramBotService.class);
+    private static final String QUESTION_PROMPT = "Generate one exam-style multiple-choice question for AWS DVA-C02 with exactly 4 possible answers. "
+            + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
+    private static final String QUESTION_PROMPT_GENERIC = "Generate one multiple-choice question with exactly 4 possible answers. "
+            + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
 
-    @Value("${telegram.bot.username}")
-    private String botUsername;
+    private static final String[] SUPPORTED_TOPICS = {"java", "aws", "kafka", "database"};
 
-    @Value("${telegram.bot.chatid}")
-    private String chatId;
+    /** Per-chat active question: question text, options, correct answer, user answers, and when it was sent. */
+    private static final class ActiveQuestion {
+        final String questionText;
+        final List<String> options;
+        final String correctAnswer;
+        final Map<Long, String> userIdToAnswer = new ConcurrentHashMap<>();
+        final Map<Long, String> userIdToDisplayName = new ConcurrentHashMap<>();
+        final Map<Long, String> userIdToUsername = new ConcurrentHashMap<>();
+        final Long questionBankId;
+        final long sentAtMs;
+        final long resultsDelayMs;
 
+        ActiveQuestion(GeneratedQuestion q, long resultsDelayMs) {
+            this(q, resultsDelayMs, null);
+        }
+
+        ActiveQuestion(GeneratedQuestion q, long resultsDelayMs, Long questionBankId) {
+            this.questionText = q.getQuestion();
+            this.options = q.getOptions() != null ? List.copyOf(q.getOptions()) : List.of();
+            this.correctAnswer = normalizeOption(q.getCorrectAnswer());
+            this.questionBankId = questionBankId;
+            this.sentAtMs = System.currentTimeMillis();
+            this.resultsDelayMs = resultsDelayMs > 0 ? resultsDelayMs : 2 * 60 * 1000;
+        }
+
+        boolean recordAnswer(long userId, String displayName, String username, String answer) {
+            String letter = normalizeOption(answer);
+            if (letter != null && !userIdToAnswer.containsKey(userId)) {
+                userIdToAnswer.put(userId, letter);
+                userIdToDisplayName.put(userId, displayName != null && !displayName.isBlank() ? displayName : "User" + userId);
+                if (username != null && !username.isBlank()) userIdToUsername.put(userId, username);
+                return true;
+            }
+            return false;
+        }
+
+        boolean isExpired(long nowMs) {
+            return (nowMs - sentAtMs) >= resultsDelayMs;
+        }
+
+        String buildResultsMessage() {
+            String correct = correctAnswer != null ? correctAnswer : "?";
+            List<String> correctUsers = new ArrayList<>();
+            List<String[]> wrongUsers = new ArrayList<>(); // [displayName, chosenLetter]
+            for (Map.Entry<Long, String> e : userIdToAnswer.entrySet()) {
+                String name = userIdToDisplayName.getOrDefault(e.getKey(), "User" + e.getKey());
+                String chosen = e.getValue();
+                if (correct.equals(chosen)) {
+                    correctUsers.add(name);
+                } else {
+                    wrongUsers.add(new String[]{name, chosen != null ? chosen : "?"});
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("Correct answer: ").append(correct).append("\n\n");
+            sb.append("Correct users:\n");
+            if (correctUsers.isEmpty()) {
+                sb.append("(none)\n");
+            } else {
+                for (String u : correctUsers) sb.append("✅ ").append(u).append("\n");
+            }
+            sb.append("\nWrong answers:\n");
+            if (wrongUsers.isEmpty()) {
+                sb.append("(none)\n");
+            } else {
+                for (String[] w : wrongUsers) {
+                    sb.append("❌ ").append(w[0]).append(" (chose ").append(w[1]).append(")\n");
+                }
+            }
+            return sb.toString();
+        }
+    }
+
+    /** Accepts A-D, a-d, 1-4, "A.", "A)", "option A", etc. */
+    private static String normalizeOption(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String s = raw.trim().toUpperCase();
+        if (s.isEmpty()) return null;
+        char first = s.charAt(0);
+        if (first >= 'A' && first <= 'D') return String.valueOf(first);
+        if (first >= '1' && first <= '4') return String.valueOf((char) ('A' + (first - '1')));
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'D') return String.valueOf(c);
+            if (c >= '1' && c <= '4') return String.valueOf((char) ('A' + (c - '1')));
+        }
+        return null;
+    }
+
+    private final Map<String, ActiveQuestion> activeQuestionsByChat = new ConcurrentHashMap<>();
+
+    private final String botUsername;
+    private final String defaultChatId;
     private final OpenAIService openAIService;
+    private final QuestionBankService questionBankService;
+    private final QuizUserService quizUserService;
+    private final LeaderboardService leaderboardService;
+    /** Answer time in seconds before results are shown (e.g. 30). */
+    private final int answerSeconds;
 
-    public TelegramBotService(OpenAIService openAIService) {
+    public TelegramBotService(
+            @Value("${telegram.bot.token}") String botToken,
+            @Value("${telegram.bot.username}") String botUsername,
+            @Value("${telegram.bot.chatid}") String chatId,
+            @Value("${telegram.quiz.answer-seconds:30}") int answerSeconds,
+            OpenAIService openAIService,
+            QuestionBankService questionBankService,
+            QuizUserService quizUserService,
+            LeaderboardService leaderboardService) {
+        super(requireNonBlank(botToken, "telegram.bot.token must be set (e.g. TELEGRAM_BOT_TOKEN)"));
+        this.botUsername = botUsername != null ? botUsername : "";
+        this.defaultChatId = chatId != null ? chatId : "";
+        this.answerSeconds = answerSeconds > 0 ? answerSeconds : 30;
         this.openAIService = openAIService;
+        this.questionBankService = questionBankService;
+        this.quizUserService = quizUserService;
+        this.leaderboardService = leaderboardService;
     }
 
+    private static String requireNonBlank(String value, String message) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException(message);
+        }
+        return value;
+    }
 
+    /** Generate and send a question to the default chat. */
     public void sendGeneratedQuestion() {
-        String prompt = "Generate a exam like multiple-choice question on aws-dva-c02 with 4 possible answers. Format: {question: '', options: ['', '', '', '']}";
-        String response = openAIService.getChatGPTResponse(prompt);
-
-        // Parse the response (assuming it's formatted correctly)
-        String question = response.split("question: '")[1].split("'")[0];
-        String[] optionsArray = response.split("options: \\[")[1].split("\\]")[0].replace("'", "").split(",");
-
-        List<String> options = Arrays.asList(optionsArray);
-
-        sendPoll(question, options);
+        sendGeneratedQuestion(defaultChatId, QUESTION_PROMPT);
     }
 
-    public void sendGeneratedQuestion(String chatId) {
-        String prompt = "Generate a multiple-choice question with 4 possible answers. Format: {question: '', options: ['', '', '', '']}";
-        String response = openAIService.getChatGPTResponse(prompt);
-
-        // Parse the response to extract question and options
-        String question = response.split("question: '")[1].split("'")[0];
-        String[] optionsArray = response.split("options: \\[")[1].split("\\]")[0].replace("'", "").split(",");
-
-        List<String> options = Arrays.asList(optionsArray);
-
-        sendPoll(chatId, question, options);
+    /** Generate and send a question to the given chat. */
+    public void sendGeneratedQuestion(String targetChatId) {
+        sendGeneratedQuestion(targetChatId, QUESTION_PROMPT_GENERIC);
     }
 
+    /** Generate and send a topic-based question to the given chat. Returns true if topic was valid and question sent. */
+    public boolean sendGeneratedQuestionForTopic(String targetChatId, String topic) {
+        String prompt = buildTopicPrompt(topic);
+        if (prompt == null) return false;
+        GeneratedQuestion generated = generateQuestion(prompt);
+        if (generated == null) {
+            sendMessage(targetChatId, "Sorry, I couldn't generate a question right now. Please try again later.");
+            return true;
+        }
+        var saved = questionBankService.saveFromGenerated(generated);
+        sendQuestionAsText(targetChatId, generated, saved != null ? saved.getId() : null);
+        return true;
+    }
+
+    /** Build OpenAI prompt for a topic. Returns null if topic is not supported. */
+    public static String buildTopicPrompt(String topic) {
+        if (topic == null || topic.isBlank()) return null;
+        String t = topic.trim().toLowerCase();
+        String subject;
+        switch (t) {
+            case "java":
+                subject = "Java programming and interviews (core Java, collections, concurrency, JVM)";
+                break;
+            case "aws":
+                subject = "AWS (DVA-C02 style: services, serverless, DynamoDB, S3, Lambda, etc.)";
+                break;
+            case "kafka":
+                subject = "Apache Kafka (concepts, brokers, topics, consumers, producers, partitioning)";
+                break;
+            case "database":
+                subject = "Databases and SQL (relational DBs, queries, indexing, transactions, NoSQL basics)";
+                break;
+            default:
+                return null;
+        }
+        return "Generate one multiple-choice interview-style question about " + subject + " with exactly 4 possible answers. "
+                + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
+    }
+
+    public static boolean isSupportedTopic(String topic) {
+        if (topic == null || topic.isBlank()) return false;
+        String t = topic.trim().toLowerCase();
+        for (String s : SUPPORTED_TOPICS) if (s.equals(t)) return true;
+        return false;
+    }
+
+    private void sendGeneratedQuestion(String targetChatId, String prompt) {
+        GeneratedQuestion generated = generateQuestion(prompt);
+        if (generated == null) {
+            sendMessage(targetChatId, "Sorry, I couldn't generate a question right now. Please try again later.");
+            return;
+        }
+        var saved = questionBankService.saveFromGenerated(generated);
+        sendQuestionAsText(targetChatId, generated, saved != null ? saved.getId() : null);
+    }
+
+    /**
+     * Calls OpenAI and parses response into a question and options. Returns null on failure or invalid response.
+     */
+    public GeneratedQuestion generateQuestion(String prompt) {
+        String response = openAIService.getChatGPTResponse(prompt);
+        return parseGeneratedQuestion(response);
+    }
+
+    /** Parse OpenAI response (expects JSON with "question", "options", and "correctAnswer"). */
+    static GeneratedQuestion parseGeneratedQuestion(String response) {
+        if (response == null || response.isBlank()) return null;
+        String trimmed = response.trim();
+        if (trimmed.startsWith("```")) {
+            int start = trimmed.indexOf('\n');
+            int end = trimmed.lastIndexOf("```");
+            if (start >= 0 && end > start) trimmed = trimmed.substring(start + 1, end).trim();
+            else if (start >= 0) trimmed = trimmed.substring(start + 1).trim();
+        }
+        try {
+            return parseGeneratedQuestion(new JSONObject(trimmed));
+        } catch (Exception e) {
+            log.warn("Failed to parse generated question JSON: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Parse OpenAI response that is a JSON array of question objects. Each object has "question", "options", "correctAnswer".
+     * Returns only successfully parsed questions; invalid entries are skipped.
+     */
+    public static List<GeneratedQuestion> parseGeneratedQuestionList(String response) {
+        List<GeneratedQuestion> result = new ArrayList<>();
+        if (response == null || response.isBlank()) return result;
+        String trimmed = response.trim();
+        if (trimmed.startsWith("```")) {
+            int start = trimmed.indexOf('\n');
+            int end = trimmed.lastIndexOf("```");
+            if (start >= 0 && end > start) trimmed = trimmed.substring(start + 1, end).trim();
+            else if (start >= 0) trimmed = trimmed.substring(start + 1).trim();
+        }
+        try {
+            JSONArray arr = new JSONArray(trimmed);
+            for (int i = 0; i < arr.length(); i++) {
+                GeneratedQuestion q = parseGeneratedQuestion(arr.optJSONObject(i));
+                if (q != null) result.add(q);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to parse generated question list JSON: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    private static GeneratedQuestion parseGeneratedQuestion(JSONObject json) {
+        if (json == null) return null;
+        String question = json.optString("question", null);
+        if (question == null || question.isBlank()) return null;
+        JSONArray arr = json.optJSONArray("options");
+        if (arr == null || arr.length() < 2) return null;
+        List<String> options = new ArrayList<>();
+        for (int j = 0; j < Math.min(4, arr.length()); j++) {
+            String opt = arr.optString(j, "").trim();
+            if (!opt.isEmpty()) options.add(opt);
+        }
+        if (options.size() < 2) return null;
+        String correctAnswer = json.optString("correctAnswer", "A").trim().toUpperCase();
+        if (correctAnswer.isEmpty() || correctAnswer.length() > 1) correctAnswer = "A";
+        char c = correctAnswer.charAt(0);
+        if (c < 'A' || c > 'D') correctAnswer = "A";
+        return new GeneratedQuestion(question, options, correctAnswer);
+    }
 
     public void pushQuestion(String chatId, String question) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId);
         message.setText(question);
         try {
-            execute(message); // Send the message
+            execute(message);
         } catch (TelegramApiException e) {
-            e.printStackTrace();
+            logSendError(chatId, "message", e);
         }
     }
 
-    public void sendPoll(String question, List<String> options) {
-        SendPoll poll = new SendPoll();
-        poll.setChatId(chatId);
-        poll.setQuestion(question);
-        poll.setOptions(options);
-        poll.setAllowMultipleAnswers(false);
-        poll.setProtectContent(true);
-        poll.setIsAnonymous(true); // Set to true if you want an anonymous poll
+    /** Sends the question as formatted text (Question: ... A) ... B) ... etc.) and stores it for answer collection. */
+    public void sendQuestionAsText(String chatId, GeneratedQuestion generated) {
+        sendQuestionAsText(chatId, generated, (Long) null);
+    }
 
+    /** Sends the question with optional question bank id (for persisting answers to DB). */
+    public void sendQuestionAsText(String chatId, GeneratedQuestion generated, Long questionBankId) {
+        long delayMs = answerSeconds * 1000L;
+        sendQuestionAsText(chatId, generated, delayMs, questionBankId);
+    }
+
+    /** Sends the question with a custom results delay. */
+    public void sendQuestionAsText(String chatId, GeneratedQuestion generated, long resultsDelayMs) {
+        sendQuestionAsText(chatId, generated, resultsDelayMs, null);
+    }
+
+    /** Sends the question with a custom results delay and optional question bank id. */
+    public void sendQuestionAsText(String chatId, GeneratedQuestion generated, long resultsDelayMs, Long questionBankId) {
+        List<String> options = generated.getOptions();
+        if (options == null || options.size() < 2) {
+            log.warn("Question requires at least 2 options");
+            return;
+        }
+        String chatIdKey = chatId != null ? chatId.trim() : "";
+        String[] letters = {"A", "B", "C", "D"};
+        StringBuilder text = new StringBuilder("Question: ").append(generated.getQuestion()).append("\n\n");
+        for (int i = 0; i < Math.min(4, options.size()); i++) {
+            text.append(letters[i]).append(") ").append(options.get(i).trim()).append("\n");
+        }
+        int seconds = (int) (resultsDelayMs / 1000);
+        text.append("\nReply with A, B, C, or D to answer.");
+        text.append("\n\n⏱ You have ").append(seconds).append(" seconds to answer.");
+        SendMessage message = new SendMessage();
+        message.setChatId(chatIdKey);
+        message.setText(text.toString());
+        ActiveQuestion activeQuestion = new ActiveQuestion(generated, resultsDelayMs, questionBankId);
         try {
-            execute(poll); // Send the poll
-            System.out.println("✅ Poll sent successfully!");
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
-            System.err.println("❌ Failed to send poll: " + e.getMessage());
-        }
-
-    }
-
-    public void sendPoll(String chatId, String question, List<String> options) {
-        SendPoll poll = new SendPoll();
-        poll.setChatId(chatId);
-        poll.setQuestion(question);
-        poll.setOptions(options);
-        poll.setIsAnonymous(true);
-        poll.setProtectContent(true);
-
-        try {
-            execute(poll);
-            System.out.println("✅ Poll sent successfully!");
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
-            System.err.println("❌ Failed to send poll: " + e.getMessage());
-        }
-    }
-
-        @Override
-        public void onUpdateReceived(Update update) {
-            if (update.hasMessage() && update.getMessage().hasText()) {
-                String userMessage = update.getMessage().getText();
-                Long chatId = update.getMessage().getChatId();
-
-                if (userMessage.equalsIgnoreCase("generateQuestion")) {
-                    sendGeneratedQuestion(chatId.toString()); // Generate and send a question
-                } else {
-                    sendMessage(chatId.toString(), "Send 'generateQuestion' to get a new quiz question!");
+            Message sent = execute(message);
+            if (sent != null && sent.getChat() != null) {
+                String actualChatId = sent.getChat().getId().toString();
+                activeQuestionsByChat.put(actualChatId, activeQuestion);
+                if (!actualChatId.equals(chatIdKey)) {
+                    log.info("Question sent to chat {} (Telegram chat id {}); storing under {} for answer matching", chatIdKey, actualChatId, actualChatId);
                 }
+            } else {
+                activeQuestionsByChat.put(chatIdKey, activeQuestion);
+            }
+        } catch (TelegramApiException e) {
+            logSendError(chatIdKey, "question", e);
+            activeQuestionsByChat.put(chatIdKey, activeQuestion);
+        }
+        log.info("Question sent as text to chat {} ({}s to answer)", chatIdKey, seconds);
+    }
+
+    private void sendLeaderboard(String chatId) {
+        List<LeaderboardService.LeaderboardEntry> entries = leaderboardService.getLeaderboard(10);
+        if (entries.isEmpty()) {
+            sendMessage(chatId, "🏆 Leaderboard\n\nNo scores yet. Answer quiz questions to appear here!");
+            return;
+        }
+        StringBuilder sb = new StringBuilder("🏆 Leaderboard\n\n");
+        for (LeaderboardService.LeaderboardEntry e : entries) {
+            String name = e.getUsername() != null && !e.getUsername().isBlank()
+                    ? e.getDisplayName() + " (@" + e.getUsername() + ")" : e.getDisplayName();
+            sb.append(e.getRank()).append(". ").append(name).append(" — ").append(e.getScore()).append(" correct\n");
+        }
+        sendMessage(chatId, sb.toString());
+    }
+
+    /** Closes the active question in this chat and sends the results. No-op if there is no active question. */
+    public void showResults(String chatId) {
+        if (chatId == null || chatId.isBlank()) return;
+        String key = chatId.trim();
+        ActiveQuestion active = activeQuestionsByChat.remove(key);
+        if (active == null) return;
+        persistAnswersToDb(active);
+        String msg = active.buildResultsMessage();
+        sendMessage(key, msg);
+        int count = active.userIdToAnswer.size();
+        log.info("Results sent to chat {} ({} answers)", key, count);
+    }
+
+    /** Called by scheduler: close any question that has passed the results delay and send results. */
+    public void closeExpiredQuestions() {
+        long now = System.currentTimeMillis();
+        List<String> toClose = new ArrayList<>();
+        for (Map.Entry<String, ActiveQuestion> e : activeQuestionsByChat.entrySet()) {
+            if (e.getValue().isExpired(now)) toClose.add(e.getKey());
+        }
+        for (String chatId : toClose) {
+            ActiveQuestion active = activeQuestionsByChat.remove(chatId);
+            if (active != null) {
+                persistAnswersToDb(active);
+                sendMessage(chatId, active.buildResultsMessage());
+                log.info("Results sent to chat {} (expired, answers: {})", chatId, active.userIdToAnswer.size());
             }
         }
+    }
+
+    private void persistAnswersToDb(ActiveQuestion active) {
+        try {
+            quizUserService.persistAnswers(
+                    active.userIdToAnswer,
+                    active.userIdToDisplayName,
+                    active.userIdToUsername,
+                    active.correctAnswer,
+                    active.questionBankId,
+                    Instant.now());
+        } catch (Exception e) {
+            log.warn("Failed to persist answers to database: {}", e.getMessage());
+        }
+    }
+
+    private void logSendError(String chatId, String what, TelegramApiException e) {
+        String msg = e.getMessage() != null ? e.getMessage() : "";
+        if (msg.contains("chat not found") || msg.contains("400")) {
+            log.error("Failed to send {} to chat {}: {}. " +
+                    "Ensure the user has opened a chat with this bot and sent /start, and that the chat ID is correct.",
+                    what, chatId, e.getMessage());
+        } else {
+            log.error("Failed to send {} to chat {}: {}", what, chatId, e.getMessage());
+        }
+    }
+
+    @Override
+    public void onUpdateReceived(Update update) {
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            String userMessage = update.getMessage().getText().trim();
+            String chatId = update.getMessage().getChatId().toString().trim();
+
+            ActiveQuestion active = activeQuestionsByChat.get(chatId);
+            if (active == null && defaultChatId != null && !defaultChatId.isBlank()) {
+                String configId = defaultChatId.trim();
+                if (!configId.equals(chatId)) {
+                    active = activeQuestionsByChat.get(configId);
+                    if (active != null) {
+                        activeQuestionsByChat.remove(configId);
+                        activeQuestionsByChat.put(chatId, active);
+                        log.debug("Mapped active question from config chat {} to update chat {}", configId, chatId);
+                    }
+                }
+            }
+            String option = normalizeOption(userMessage);
+            if (active != null && option != null) {
+                User from = update.getMessage().getFrom();
+                long userId = from != null ? from.getId() : 0L;
+                String displayName = from != null ? (from.getFirstName() != null ? from.getFirstName() : from.getUserName()) : "User";
+                if (from != null && from.getLastName() != null && !from.getLastName().isBlank()) {
+                    displayName = (from.getFirstName() != null ? from.getFirstName() + " " : "") + from.getLastName();
+                }
+                String username = from != null ? from.getUserName() : null;
+                if (active.recordAnswer(userId, displayName, username, option)) {
+                    log.info("Recorded answer chatId={} userId={} name={} option={}", chatId, userId, displayName, option);
+                }
+                return;
+            }
+            if (userMessage.equalsIgnoreCase("showResults") && active != null) {
+                showResults(chatId);
+                return;
+            }
+            if (userMessage.equalsIgnoreCase("/leaderboard") || userMessage.equalsIgnoreCase("leaderboard")) {
+                sendLeaderboard(chatId);
+                return;
+            }
+            if (userMessage.equalsIgnoreCase("generateQuestion")) {
+                sendGeneratedQuestion(chatId);
+            } else if (userMessage.toLowerCase().startsWith("/quiz")) {
+                String topic = userMessage.length() > 5 ? userMessage.substring(5).trim() : "";
+                if (topic.isEmpty()) {
+                    sendMessage(chatId, "Usage: /quiz <topic>\n\nTopics: java, aws, kafka, database\n\nExample: /quiz java\n\nYou have " + answerSeconds + " seconds to answer each question.");
+                } else if (!isSupportedTopic(topic)) {
+                    sendMessage(chatId, "Unknown topic. Use one of: java, aws, kafka, database");
+                } else {
+                    sendGeneratedQuestionForTopic(chatId, topic);
+                }
+            } else if (userMessage.equalsIgnoreCase("/start") || userMessage.equalsIgnoreCase("help")) {
+                sendMessage(chatId, "Quiz commands:\n• /quiz java – Java interview questions\n• /quiz aws – AWS questions\n• /quiz kafka – Kafka questions\n• /quiz database – Database/SQL questions\n• /leaderboard – See top scores\n\nYou have " + answerSeconds + " seconds to answer. Reply with A, B, C, or D. Send 'showResults' to see results early.");
+            } else {
+                sendMessage(chatId, "Send /quiz <topic> (java, aws, kafka, database) for a quiz, /leaderboard for scores, or 'help' for more.");
+            }
+        }
+    }
 
     public void sendMessage(String chatId, String messageText) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId);
         message.setText(messageText);
-
         try {
             execute(message);
         } catch (TelegramApiException e) {
-            e.printStackTrace();
+            logSendError(chatId, "message", e);
         }
     }
 
@@ -134,12 +505,4 @@ public class TelegramBotService extends TelegramLongPollingBot {
     public String getBotUsername() {
         return botUsername;
     }
-
-    @Override
-    public String getBotToken() {
-        return botToken;
-    }
-
-
-
 }
