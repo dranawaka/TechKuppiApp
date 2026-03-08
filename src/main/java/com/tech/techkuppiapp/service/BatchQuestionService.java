@@ -18,11 +18,11 @@ public class BatchQuestionService {
 
     private static final int BATCH_MAX_TOKENS = 4000;
 
-    private final OpenAIService openAIService;
+    private final LLMService llmService;
     private final QuestionBankService questionBankService;
 
-    public BatchQuestionService(OpenAIService openAIService, QuestionBankService questionBankService) {
-        this.openAIService = openAIService;
+    public BatchQuestionService(LLMService llmService, QuestionBankService questionBankService) {
+        this.llmService = llmService;
         this.questionBankService = questionBankService;
     }
 
@@ -38,7 +38,7 @@ public class BatchQuestionService {
         String prompt = buildBatchPrompt(safeCount, topic);
         log.info("Requesting batch of {} questions from AI (topic={})", safeCount, topic);
 
-        String response = openAIService.getChatGPTResponse(prompt, BATCH_MAX_TOKENS);
+        String response = llmService.generate(prompt, BATCH_MAX_TOKENS);
         List<GeneratedQuestion> generated = TelegramBotService.parseGeneratedQuestionList(response);
 
         if (generated.isEmpty()) {

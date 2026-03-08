@@ -41,7 +41,7 @@ public class QuestionBankController {
 
         if (saved.isEmpty()) {
             return ResponseEntity.ok(
-                    BatchQuestionsResponse.error("No questions could be generated or parsed. Check OpenAI API key and prompt."));
+                    BatchQuestionsResponse.error("No questions could be generated or parsed. Check AI provider (app.ai.provider) and prompt."));
         }
 
         List<Long> ids = saved.stream().map(QuestionBank::getId).collect(Collectors.toList());

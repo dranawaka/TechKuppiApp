@@ -9,5 +9,12 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_BOT_CHAT_ID=your_chat_or_group_id
 
-# OpenAI API
+# AI provider for question generation: openai (default) or ollama (local)
+APP_AI_PROVIDER=openai
+
+# OpenAI API (used when APP_AI_PROVIDER=openai)
 OPENAI_API_KEY=your_openai_api_key
+
+# Ollama (used when APP_AI_PROVIDER=ollama; optional - defaults shown)
+# OLLAMA_API_BASE_URL=http://localhost:11434/v1
+# OLLAMA_API_MODEL=llama3.2

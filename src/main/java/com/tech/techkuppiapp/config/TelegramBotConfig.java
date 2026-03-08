@@ -1,6 +1,8 @@
 package com.tech.techkuppiapp.config;
 
 import com.tech.techkuppiapp.service.TelegramBotService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -11,11 +13,18 @@ import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 @Configuration
 public class TelegramBotConfig {
 
+    private static final Logger log = LoggerFactory.getLogger(TelegramBotConfig.class);
+
+    /**
+     * Registers the bot with Telegram long polling. Only one instance of the app (per token) must run;
+     * otherwise Telegram returns 409 Conflict (terminated by other getUpdates request).
+     */
     @Bean
     @ConditionalOnExpression("!'${telegram.bot.token:}'.isBlank()")
     public TelegramBotsApi telegramBotsApi(TelegramBotService botService) throws TelegramApiException {
         TelegramBotsApi telegramBotsApi = new TelegramBotsApi(DefaultBotSession.class);
         telegramBotsApi.registerBot(botService);
+        log.info("Telegram bot registered (long polling). Ensure only one app instance is running to avoid 409 Conflict.");
         return telegramBotsApi;
     }
 }
