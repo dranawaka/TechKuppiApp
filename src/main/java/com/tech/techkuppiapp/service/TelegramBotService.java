@@ -134,9 +134,9 @@ public class TelegramBotService extends TelegramLongPollingBot {
     private final LeaderboardService leaderboardService;
     /** Answer time in seconds before results are shown (e.g. 30). */
     private final int answerSeconds;
-    /** Question source: "openai" or "question-bank". When question-bank, topic is ignored. When openai, uses app.ai.provider (openai or ollama). */
+    /** Question source: "openai" or "question-bank". When question-bank, topic is ignored. When openai, uses app.ai.provider (openai, ollama, or gemini). */
     private final String questionSource;
-    /** AI provider label for logging/source when generating: "openai" or "ollama". */
+    /** AI provider label for logging/source when generating: "openai", "ollama", or "gemini". */
     private final String aiProvider;
 
     public TelegramBotService(

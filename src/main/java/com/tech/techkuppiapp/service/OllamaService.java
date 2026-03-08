@@ -68,8 +68,8 @@ public class OllamaService implements LLMService {
             ResponseEntity<String> response = restTemplate.exchange(
                     url, HttpMethod.POST, entity, String.class);
             String content = parseContent(response.getBody());
-            if (content != null) {
-                log.info("Ollama model response: {}", content);
+            if (content != null && log.isDebugEnabled()) {
+                log.debug("Ollama model response: {}", content);
             }
             return content;
         } catch (HttpClientErrorException e) {

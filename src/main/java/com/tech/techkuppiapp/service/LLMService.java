@@ -1,7 +1,7 @@
 package com.tech.techkuppiapp.service;
 
 /**
- * Abstraction for LLM-based text generation (OpenAI or Ollama).
+ * Abstraction for LLM-based text generation (OpenAI, Ollama, or Gemini).
  * Allows switching between providers via {@code app.ai.provider}.
  */
 public interface LLMService {

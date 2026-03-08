@@ -108,6 +108,7 @@
 |-------------|------|
 | **OpenAI**  | Chat completions for single/batch question generation when `app.ai.provider=openai` (model, max tokens, temperature in config). |
 | **Ollama**  | Local LLM via OpenAI-compatible API when `app.ai.provider=ollama` (base URL, model, e.g. llama3.2). |
+| **Gemini**  | Google Gemini API (e.g. Gemini 3 Flash) when `app.ai.provider=gemini` (API key, model, max tokens, temperature). |
 | **Telegram**| Long-polling bot; send message to group; parse commands and reply text (A/B/C/D). |
 | **PostgreSQL** | Persistence; DB created automatically if missing (when `spring.datasource.create-database-if-not-exists` is true). |
 
@@ -117,9 +118,10 @@
 
 - **Application**: `application.yml` — server port, logging, app name.
 - **DataSource**: PostgreSQL URL, credentials (env-overridable: `POSTGRES_*`), JPA/Hibernate, optional DB creation.
-- **AI provider**: `app.ai.provider` — `openai` (default) or `ollama`; controls which LLM is used for question generation (Telegram and REST batch).
+- **AI provider**: `app.ai.provider` — `openai` (default), `ollama`, or `gemini`; controls which LLM is used for question generation (Telegram and REST batch).
 - **OpenAI**: `openai.api.key`, `openai.api.model`, `openai.api.max-tokens`, `openai.api.temperature` (when provider is openai).
 - **Ollama**: `ollama.api.base-url` (default `http://localhost:11434/v1`), `ollama.api.model`, `ollama.api.max-tokens`, `ollama.api.temperature` (when provider is ollama).
+- **Gemini**: `gemini.api.key` (or `GEMINI_API_KEY` env), `gemini.api.model` (e.g. `gemini-2.0-flash` or `gemini-3-flash`), `gemini.api.max-tokens`, `gemini.api.temperature` (when provider is gemini).
 - **Telegram**: `telegram.bot.token`, `telegram.bot.chatid`, `telegram.bot.username`, `telegram.quiz.answer-seconds`, `telegram.quiz.auto-send-enabled`, `telegram.quiz.question-source` (`openai` | `question-bank`).
 - **Springdoc**: `/api-docs`, `/swagger-ui.html`, UI sort options.
 
@@ -131,14 +133,14 @@
 - **Custom DataSource**: `DataSourceConfig` ensures the PostgreSQL database exists before building the DataSource, then uses standard Spring/Hikari for pooling.
 - **In-memory active question**: Per-chat active question and answers are held in memory until the answer window closes; then results are sent and `UserAnswer` rows are written.
 - **Topic-aware batch**: Batch generation supports optional topics (e.g. java, aws, kafka, database, spring, springboot, genai) to tailor prompts.
-- **Configurable question source**: When a user asks for a question (Telegram `/quiz`, REST, or scheduler), the source is chosen by `telegram.quiz.question-source`: `openai` (generate via AI) or `question-bank` (pick a random question from the database). When generating via AI, the actual LLM is chosen by `app.ai.provider`: `openai` or `ollama`. When `question-bank` is used, topic filters are ignored. If the bank is empty, the user sees a fallback message or the scheduler sends a fixed fallback text.
+- **Configurable question source**: When a user asks for a question (Telegram `/quiz`, REST, or scheduler), the source is chosen by `telegram.quiz.question-source`: `openai` (generate via AI) or `question-bank` (pick a random question from the database). When generating via AI, the actual LLM is chosen by `app.ai.provider`: `openai`, `ollama`, or `gemini`. When `question-bank` is used, topic filters are ignored. If the bank is empty, the user sees a fallback message or the scheduler sends a fixed fallback text.
 
 ---
 
 ## 9. Deployment View
 
 - Single JVM process (Spring Boot).
-- Requires: Java 21+, PostgreSQL, network access to Telegram and to the chosen AI provider (OpenAI or Ollama at `localhost:11434` when using ollama).
+- Requires: Java 21+, PostgreSQL, network access to Telegram and to the chosen AI provider (OpenAI, Ollama at `localhost:11434`, or Google Gemini when using gemini).
 - REST and Swagger are served on the same port (default 8080); Telegram bot uses long polling (no separate webhook server required).
 
 ---
