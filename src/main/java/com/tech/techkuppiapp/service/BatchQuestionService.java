@@ -30,7 +30,7 @@ public class BatchQuestionService {
      * Request a batch of questions from the AI and save them to the database.
      *
      * @param count number of questions to generate (1–20)
-     * @param topic optional topic (java, aws, kafka, database); null = generic
+     * @param topic optional topic (java, aws, kafka, database, spring, springboot, genai); null = generic
      * @return list of saved QuestionBank entities; may be smaller than count if parsing or API fails
      */
     public List<QuestionBank> generateAndSaveBatch(int count, String topic) {
@@ -51,6 +51,8 @@ public class BatchQuestionService {
         return saved;
     }
 
+    private static final String ADVANCED_LEVEL = "Each question must be advanced, architect-level, or tech lead-level—suitable for senior engineers and system designers; avoid beginner or intermediate content. ";
+
     private static String buildBatchPrompt(int count, String topic) {
         String subject = "multiple-choice exam-style questions with exactly 4 possible answers each";
         if (topic != null && !topic.isBlank()) {
@@ -68,12 +70,21 @@ public class BatchQuestionService {
                 case "database":
                     subject = "multiple-choice Database/SQL questions (relational DBs, queries, indexing, transactions) with exactly 4 possible answers each";
                     break;
+                case "spring":
+                    subject = "multiple-choice Spring Framework questions (core, IoC, AOP, MVC, security, transactions, testing) with exactly 4 possible answers each";
+                    break;
+                case "springboot":
+                    subject = "multiple-choice Spring Boot questions (auto-configuration, starters, Actuator, embedded servers, profiles, production readiness) with exactly 4 possible answers each";
+                    break;
+                case "genai":
+                    subject = "multiple-choice Generative AI questions (LLMs, RAG, prompt engineering, agents, embeddings, model evaluation, production GenAI systems) with exactly 4 possible answers each";
+                    break;
                 default:
                     break;
             }
         }
 
-        return "Generate exactly " + count + " " + subject + ". "
+        return "Generate exactly " + count + " " + subject + ". " + ADVANCED_LEVEL
                 + "Return ONLY a valid JSON array. Each element must be an object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). "
                 + "No markdown, no code fences, no extra text—just the JSON array.";
     }

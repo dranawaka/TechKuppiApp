@@ -8,7 +8,7 @@ public class BatchQuestionsRequest {
     /** Number of questions to generate (default 5, max typically 10–20 for one API call). */
     private Integer count = 5;
 
-    /** Optional topic: java, aws, kafka, database. If null/blank, generic questions are generated. */
+    /** Optional topic: java, aws, kafka, database, spring, springboot, genai. If null/blank, generic questions are generated. */
     private String topic;
 
     public BatchQuestionsRequest() {

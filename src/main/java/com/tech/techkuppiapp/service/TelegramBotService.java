@@ -1,6 +1,7 @@
 package com.tech.techkuppiapp.service;
 
 import com.tech.techkuppiapp.dto.GeneratedQuestion;
+import com.tech.techkuppiapp.entity.QuestionBank;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.slf4j.Logger;
@@ -19,6 +20,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
@@ -26,12 +28,13 @@ import java.util.concurrent.ConcurrentHashMap;
 public class TelegramBotService extends TelegramLongPollingBot {
 
     private static final Logger log = LoggerFactory.getLogger(TelegramBotService.class);
-    private static final String QUESTION_PROMPT = "Generate one exam-style multiple-choice question for AWS DVA-C02 with exactly 4 possible answers. "
-            + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
-    private static final String QUESTION_PROMPT_GENERIC = "Generate one multiple-choice question with exactly 4 possible answers. "
-            + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
+    private static final String ADVANCED_LEVEL = " The question must be advanced, architect-level, or tech lead-level—suitable for senior engineers and system designers; avoid beginner or intermediate content.";
+    private static final String QUESTION_PROMPT = "Generate one exam-style multiple-choice question for AWS DVA-C02 with exactly 4 possible answers." + ADVANCED_LEVEL
+            + " Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
+    private static final String QUESTION_PROMPT_GENERIC = "Generate one multiple-choice question with exactly 4 possible answers." + ADVANCED_LEVEL
+            + " Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
 
-    private static final String[] SUPPORTED_TOPICS = {"java", "aws", "kafka", "database"};
+    private static final String[] SUPPORTED_TOPICS = {"java", "aws", "kafka", "database", "spring", "springboot", "genai"};
 
     /** Per-chat active question: question text, options, correct answer, user answers, and when it was sent. */
     private static final class ActiveQuestion {
@@ -132,12 +135,15 @@ public class TelegramBotService extends TelegramLongPollingBot {
     private final LeaderboardService leaderboardService;
     /** Answer time in seconds before results are shown (e.g. 30). */
     private final int answerSeconds;
+    /** Question source: "openai" or "question-bank". When question-bank, topic is ignored. */
+    private final String questionSource;
 
     public TelegramBotService(
             @Value("${telegram.bot.token}") String botToken,
             @Value("${telegram.bot.username}") String botUsername,
             @Value("${telegram.bot.chatid}") String chatId,
             @Value("${telegram.quiz.answer-seconds:30}") int answerSeconds,
+            @Value("${telegram.quiz.question-source:openai}") String questionSource,
             OpenAIService openAIService,
             QuestionBankService questionBankService,
             QuizUserService quizUserService,
@@ -146,6 +152,7 @@ public class TelegramBotService extends TelegramLongPollingBot {
         this.botUsername = botUsername != null ? botUsername : "";
         this.defaultChatId = chatId != null ? chatId : "";
         this.answerSeconds = answerSeconds > 0 ? answerSeconds : 30;
+        this.questionSource = questionSource != null && !questionSource.isBlank() ? questionSource.trim().toLowerCase() : "openai";
         this.openAIService = openAIService;
         this.questionBankService = questionBankService;
         this.quizUserService = quizUserService;
@@ -169,17 +176,26 @@ public class TelegramBotService extends TelegramLongPollingBot {
         sendGeneratedQuestion(targetChatId, QUESTION_PROMPT_GENERIC);
     }
 
-    /** Generate and send a topic-based question to the given chat. Returns true if topic was valid and question sent. */
+    /** Sends a random question from the question bank to the given chat. Sends a fallback message if the bank is empty. */
+    public void sendRandomQuestionFromBank(String targetChatId) {
+        questionBankService.getRandomQuestionEntity()
+                .map(q -> new ResolvedQuestion(
+                        new GeneratedQuestion(q.getQuestion(), q.getOptions(), q.getCorrectAnswer()),
+                        q.getId()))
+                .ifPresentOrElse(
+                        r -> sendResolvedQuestion(targetChatId, r),
+                        () -> sendMessage(targetChatId, "No questions in the bank yet. Add questions via POST /api/questions/batch.")
+                );
+    }
+
+    /** Generate and send a topic-based question to the given chat. Returns true if topic was valid and question sent. When source is question-bank, topic is ignored. */
     public boolean sendGeneratedQuestionForTopic(String targetChatId, String topic) {
-        String prompt = buildTopicPrompt(topic);
+        String prompt = "question-bank".equals(questionSource) ? QUESTION_PROMPT_GENERIC : buildTopicPrompt(topic);
         if (prompt == null) return false;
-        GeneratedQuestion generated = generateQuestion(prompt);
-        if (generated == null) {
-            sendMessage(targetChatId, "Sorry, I couldn't generate a question right now. Please try again later.");
-            return true;
-        }
-        var saved = questionBankService.saveFromGenerated(generated);
-        sendQuestionAsText(targetChatId, generated, saved != null ? saved.getId() : null);
+        resolveQuestion(prompt).ifPresentOrElse(
+                r -> sendResolvedQuestion(targetChatId, r),
+                () -> sendMessage(targetChatId, "Sorry, I couldn't get a question right now. Try again later or add questions via POST /api/questions/batch.")
+        );
         return true;
     }
 
@@ -201,10 +217,19 @@ public class TelegramBotService extends TelegramLongPollingBot {
             case "database":
                 subject = "Databases and SQL (relational DBs, queries, indexing, transactions, NoSQL basics)";
                 break;
+            case "spring":
+                subject = "Spring Framework (core, IoC, AOP, MVC, security, transactions, testing)";
+                break;
+            case "springboot":
+                subject = "Spring Boot (auto-configuration, starters, Actuator, embedded servers, profiles, production readiness)";
+                break;
+            case "genai":
+                subject = "Generative AI (LLMs, RAG, prompt engineering, agents, embeddings, model evaluation, production GenAI systems)";
+                break;
             default:
                 return null;
         }
-        return "Generate one multiple-choice interview-style question about " + subject + " with exactly 4 possible answers. "
+        return "Generate one multiple-choice interview-style question about " + subject + " with exactly 4 possible answers. The question must be advanced, architect-level, or tech lead-level—suitable for senior engineers and system designers; avoid beginner or intermediate content. "
                 + "Return only a valid JSON object with keys: \"question\" (string), \"options\" (array of exactly 4 strings, in order A to D), and \"correctAnswer\" (string: \"A\", \"B\", \"C\", or \"D\"). No markdown, no extra text.";
     }
 
@@ -216,13 +241,52 @@ public class TelegramBotService extends TelegramLongPollingBot {
     }
 
     private void sendGeneratedQuestion(String targetChatId, String prompt) {
-        GeneratedQuestion generated = generateQuestion(prompt);
-        if (generated == null) {
-            sendMessage(targetChatId, "Sorry, I couldn't generate a question right now. Please try again later.");
-            return;
+        resolveQuestion(prompt).ifPresentOrElse(
+                r -> sendResolvedQuestion(targetChatId, r),
+                () -> sendMessage(targetChatId, "Sorry, I couldn't get a question right now. Try again later or add questions via POST /api/questions/batch.")
+        );
+    }
+
+    /** Send a resolved question (save to bank if from OpenAI and get id, then send). */
+    private void sendResolvedQuestion(String targetChatId, ResolvedQuestion r) {
+        Long id = r.questionBankId();
+        if (id == null) {
+            QuestionBank saved = questionBankService.saveFromGenerated(r.question());
+            id = saved != null ? saved.getId() : null;
         }
-        var saved = questionBankService.saveFromGenerated(generated);
-        sendQuestionAsText(targetChatId, generated, saved != null ? saved.getId() : null);
+        sendQuestionAsText(targetChatId, r.question(), id);
+    }
+
+    /**
+     * Resolves the next question from the configured source (openai or question-bank).
+     * When question-bank, openAiPrompt is ignored and a random question is returned with its id.
+     * When openai, generates using the prompt and returns question with id=null (caller should save to get id).
+     */
+    public Optional<ResolvedQuestion> resolveQuestion(String openAiPrompt) {
+        if ("question-bank".equals(questionSource)) {
+            return questionBankService.getRandomQuestionEntity()
+                    .map(q -> new ResolvedQuestion(
+                            new GeneratedQuestion(q.getQuestion(), q.getOptions(), q.getCorrectAnswer()),
+                            q.getId()));
+        }
+        GeneratedQuestion g = generateQuestion(openAiPrompt);
+        return g != null ? Optional.of(new ResolvedQuestion(g, null)) : Optional.empty();
+    }
+
+    private record ResolvedQuestion(GeneratedQuestion question, Long questionBankId) {}
+
+    /**
+     * Resolves the next question (from configured source) and sends it to the chat, or sends a fallback message if none available.
+     * Used by the scheduler and any caller that wants one question sent.
+     */
+    public void sendNextQuestion(String chatId, String openAiPrompt) {
+        resolveQuestion(openAiPrompt).ifPresentOrElse(
+                r -> sendResolvedQuestion(chatId, r),
+                () -> {
+                    pushQuestion(chatId, "What is the most exciting thing you've learned today?");
+                    log.debug("Sent fallback text question (no question available from configured source)");
+                }
+        );
     }
 
     /**
@@ -475,17 +539,15 @@ public class TelegramBotService extends TelegramLongPollingBot {
                 sendGeneratedQuestion(chatId);
             } else if (userMessage.toLowerCase().startsWith("/quiz")) {
                 String topic = userMessage.length() > 5 ? userMessage.substring(5).trim() : "";
-                if (topic.isEmpty()) {
-                    sendMessage(chatId, "Usage: /quiz <topic>\n\nTopics: java, aws, kafka, database\n\nExample: /quiz java\n\nYou have " + answerSeconds + " seconds to answer each question.");
-                } else if (!isSupportedTopic(topic)) {
-                    sendMessage(chatId, "Unknown topic. Use one of: java, aws, kafka, database");
+                if (!topic.isEmpty() && !isSupportedTopic(topic)) {
+                    sendMessage(chatId, "Unknown topic. Use one of: java, aws, kafka, database, spring, springboot, genai");
                 } else {
-                    sendGeneratedQuestionForTopic(chatId, topic);
+                    sendRandomQuestionFromBank(chatId);
                 }
             } else if (userMessage.equalsIgnoreCase("/start") || userMessage.equalsIgnoreCase("help")) {
-                sendMessage(chatId, "Quiz commands:\n• /quiz java – Java interview questions\n• /quiz aws – AWS questions\n• /quiz kafka – Kafka questions\n• /quiz database – Database/SQL questions\n• /leaderboard – See top scores\n\nYou have " + answerSeconds + " seconds to answer. Reply with A, B, C, or D. Send 'showResults' to see results early.");
+                sendMessage(chatId, "Quiz commands:\n• /quiz or /quiz <topic> – random question from the bank\n  Topics: java, aws, kafka, database, spring, springboot, genai\n• /leaderboard – See top scores\n\nYou have " + answerSeconds + " seconds to answer. Reply with A, B, C, or D. Send 'showResults' to see results early.");
             } else {
-                sendMessage(chatId, "Send /quiz <topic> (java, aws, kafka, database) for a quiz, /leaderboard for scores, or 'help' for more.");
+                sendMessage(chatId, "Send /quiz or /quiz <topic> for a random question from the bank, /leaderboard for scores, or 'help' for more.");
             }
         }
     }
